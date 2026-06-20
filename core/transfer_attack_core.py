@@ -1,14 +1,15 @@
 import os
 import uuid
 from pathlib import Path
-
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
-
+import cv2
 import numpy as np
 import tensorflow as tf
 from PIL import Image
 from deepface import DeepFace
+
+# --- Runtime & Configuration Setup ---
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 
 ATTACKER_MODELS = {
     'Facenet512': (160, 160),
@@ -24,11 +25,9 @@ ALL_ATTACKS = [
     'MI_FGSM',
     'TI_FGSM',
     'SI_NI_FGSM',
+    'SEMANTIC_MI_FGSM',
     'MI_ADMIX_DI_TI',
-    'BPA_CNN',
-    'BSR',
-    'DECOWA',
-    'SIA_MI_TI',
+    'DYNAMIC_MORPH'
 ]
 
 ATTACK_COLS = {
@@ -37,21 +36,14 @@ ATTACK_COLS = {
     'TI_FGSM': 'ti_fgsm_path',
     'SI_NI_FGSM': 'si_ni_fgsm_path',
     'MI_ADMIX_DI_TI': 'mi_admix_di_ti_path',
-    'BPA_CNN': 'bpa_cnn_path',
-    'BSR': 'bsr_path',
-    'DECOWA': 'decowa_path',
-    'SIA_MI_TI': 'sia_mi_ti_path',
+    'DYNAMIC_MORPH': 'dynamic_morph_path'
 }
 
 EPSILON = 0.062
 NUM_ITER = 5
 DECAY = 1.0
-DECOWA_MESH = 3
-DECOWA_NUM_WARPING = 20
-DECOWA_NOISE_SCALE = 2.0
-DECOWA_RHO = 0.01
 
-
+# --- Helper Utilities ---
 def configure_cpu_runtime(tf_threads: int = 1) -> None:
     try:
         tf.config.set_visible_devices([], 'GPU')
@@ -135,6 +127,7 @@ def input_diversity(x, input_size, prob=0.7):
     return tf.image.resize(x_padded, input_size)
 
 
+# --- Baseline Attack Implementations ---
 def pgd_attack(model, x, tgt_emb, attack_type, random_start=True):
     if random_start:
         noise = tf.random.uniform(tf.shape(x), minval=-EPSILON, maxval=EPSILON, dtype=x.dtype)
@@ -248,386 +241,91 @@ def mi_admix_di_ti(model, x, tgt_emb, attack_type, pool_imgs, input_size):
         adv = tf.clip_by_value(adv, -1.0, 1.0)
     return adv
 
-# Student-contributed attack integration:
-# BPA_CNN by Om Singh Rawat (IIT Delhi)
-# Paper basis: Rethinking the Backward Propagation for Adversarial Transferability
-# (NeurIPS 2023)
-def bpa_cnn(model, x, tgt_emb, attack_type):
-    """BPA-CNN: Backward Propagation Attack adapted for CNN face models.
 
-    BPA (NeurIPS 2023) improves adversarial transferability by replacing
-    sharp backward operations (ReLU, MaxPool) with smooth alternatives
-    (SiLU derivative, softmax-weighted pooling).
+# --- Custom Research Attack Implementations (Assignment 4) ---
+def get_semantic_mask(input_size):
+    """Generates a blurred spatial mask targeting the eyes and nose."""
+    h, w = input_size
+    mask = np.zeros((h, w, 3), dtype=np.float32)
+    
+    y1, y2 = int(h * 0.35), int(h * 0.55)
+    xl1, xl2 = int(w * 0.20), int(w * 0.45)
+    xr1, xr2 = int(w * 0.55), int(w * 0.80)
+    yn1, yn2 = int(h * 0.50), int(h * 0.70)
+    xn1, xn2 = int(w * 0.40), int(w * 0.60)
+    
+    mask[y1:y2, xl1:xl2, :] = 1.0  
+    mask[y1:y2, xr1:xr2, :] = 1.0  
+    mask[yn1:yn2, xn1:xn2, :] = 1.0  
+    
+    mask = cv2.GaussianBlur(mask, (35, 35), 0)
+    return tf.convert_to_tensor(mask, dtype=tf.float32)
 
-    Since we cannot modify internal layers of pre-trained DeepFace models,
-    we apply BPA's two key gradient-smoothing principles at the input level:
-      1. SiLU-derivative scaling  – counteracts ReLU binary gradient masking
-      2. Gaussian spatial smoothing – counteracts MaxPool gradient concentration
-    """
+
+def semantic_mi_fgsm(model, x, tgt_emb, attack_type, input_size):
+    """Semantic Feature-Level Transfer Attack Variant"""
     adv = tf.identity(x)
     g = tf.zeros_like(x)
     alpha = EPSILON / NUM_ITER
     tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
-    kernel = gaussian_kernel(k=5, sigma=1.0)
-    temperature = 3.0
-
+    
+    feature_mask = get_semantic_mask(input_size)
+    
     for _ in range(NUM_ITER):
         with tf.GradientTape() as tape:
             tape.watch(adv)
             emb = compute_embedding(model, adv)
             cos = tf.reduce_sum(emb * tgt_emb, axis=1)
             loss = attack_loss(cos, attack_type)
-
+            
         grad = tape.gradient(loss, adv)
-
-        # BPA Step 1: SiLU-inspired gradient smoothing
-        # SiLU'(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
-        # Applied to the gradient to counteract ReLU's binary masking
-        scaled = temperature * grad
-        sig = tf.sigmoid(scaled)
-        silu_deriv = sig + scaled * sig * (1.0 - sig)
-        grad = grad * silu_deriv
-
-        # BPA Step 2: Gaussian spatial smoothing
-        # Counteracts MaxPool's winner-take-all gradient concentration
-        grad = tf.nn.depthwise_conv2d(grad, kernel, [1, 1, 1, 1], 'SAME')
-
-        # Momentum accumulation (inherited from MI-FGSM base)
+        grad = grad * feature_mask
         grad = grad / (tf.reduce_mean(tf.abs(grad)) + 1e-8)
         g = DECAY * g + grad
         adv = adv + alpha * tf.sign(g)
         adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
         adv = tf.clip_by_value(adv, -1.0, 1.0)
-
+        
     return adv
 
 
-_BSR_MIN_DIM = 4
-
-
-def _bsr_get_lengths(total: int, num_block: int):
-    rand = np.random.uniform(size=num_block).astype(np.float32)
-    sizes = np.round(rand * total / rand.sum()).astype(np.int32)
-    sizes = np.maximum(sizes, _BSR_MIN_DIM)
-    while sizes.sum() > total:
-        sizes[sizes.argmax()] -= 1
-    while sizes.sum() < total:
-        sizes[sizes.argmin()] += 1
-    return sizes.tolist()
-
-
-def _bsr_rotate(image, angle_rad):
-    h_int = int(image.shape[1])
-    w_int = int(image.shape[2])
-    if h_int < _BSR_MIN_DIM or w_int < _BSR_MIN_DIM:
-        return image
-    cx, cy = float(w_int) / 2.0, float(h_int) / 2.0
-    cos_a = tf.math.cos(-angle_rad)
-    sin_a = tf.math.sin(-angle_rad)
-    tx = cx - cx * cos_a + cy * sin_a
-    ty = cy - cx * sin_a - cy * cos_a
-    transform = tf.reshape(
-        tf.stack([cos_a, -sin_a, tx, sin_a, cos_a, ty, 0.0, 0.0]), [1, 8]
-    )
-    out_shape = tf.cast(tf.stack([h_int, w_int]), dtype=tf.int32)
-    return tf.raw_ops.ImageProjectiveTransformV3(
-        images=tf.cast(image, tf.float32),
-        transforms=tf.cast(transform, tf.float32),
-        output_shape=out_shape,
-        interpolation='BILINEAR',
-        fill_mode='REFLECT',
-        fill_value=0.0,
-    )
-
-
-def _bsr_shuffle_rotate(x, num_block: int = 2):
-    h_val, w_val = int(x.shape[1]), int(x.shape[2])
-    w_strips = tf.split(x, _bsr_get_lengths(w_val, num_block), axis=2)
-    result_w = []
-    for wi in np.random.permutation(num_block).tolist():
-        h_strips = tf.split(w_strips[wi], _bsr_get_lengths(h_val, num_block), axis=1)
-        result_h = []
-        for hi in np.random.permutation(num_block).tolist():
-            angle = tf.random.truncated_normal([], stddev=0.05)
-            result_h.append(_bsr_rotate(h_strips[hi], angle))
-        result_w.append(tf.concat(result_h, axis=1))
-    return tf.concat(result_w, axis=2)
-
-
-# Student-contributed attack integration:
-# BSR by Chirag Sharma (IIIT Vadodara)
-# Paper basis: Boosting Adversarial Transferability by Block Shuffle and Rotation
-# (CVPR 2024)
-def bsr(model, x, tgt_emb, attack_type, num_copies: int = 20, num_block: int = 2):
-    adv = tf.Variable(tf.identity(x), trainable=True, dtype=tf.float32)
-    g = tf.zeros_like(x)
+def dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size):
+    """D-FMA (Pre-aligned Semantic Mixing Attack)"""
+    h, w = input_size
+    mask = np.zeros((h, w, 3), dtype=np.float32)
+    
+    mask[int(h*0.35):int(h*0.52), int(w*0.20):int(w*0.45), :] = 1.0  
+    mask[int(h*0.35):int(h*0.52), int(w*0.55):int(w*0.80), :] = 1.0  
+    mask[int(h*0.48):int(h*0.70), int(w*0.38):int(w*0.62), :] = 1.0  
+    
+    mask = cv2.GaussianBlur(mask, (25, 25), 0)
+    tf_mask = tf.convert_to_tensor(mask, dtype=tf.float32)
+    
+    morphed_tensor = (tgt * tf_mask) + (src * (1.0 - tf_mask))
+    
+    adv = tf.identity(morphed_tensor)
+    g = tf.zeros_like(adv)
     alpha = EPSILON / NUM_ITER
-    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
-    for _ in range(NUM_ITER):
-        with tf.GradientTape() as tape:
-            copies = [_bsr_shuffle_rotate(adv, num_block) for _ in range(num_copies)]
-            x_batch = tf.concat(copies, axis=0)
-            tgt_rep = tf.repeat(tgt_emb, num_copies, axis=0)
-            emb = compute_embedding(model, x_batch)
-            cos = tf.reduce_sum(emb * tgt_rep, axis=1)
-            loss = attack_loss(cos, attack_type)
-        grad = tape.gradient(loss, adv)
-        grad = grad / (tf.reduce_mean(tf.abs(grad)) + 1e-8)
-        g = DECAY * g + grad
-        adv.assign(adv + alpha * tf.sign(g))
-        adv.assign(tf.clip_by_value(adv, x - EPSILON, x + EPSILON))
-        adv.assign(tf.clip_by_value(adv, -1.0, 1.0))
-    return tf.identity(adv)
-
-
-def _decowa_grid_points_2d(width, height):
-    a = tf.linspace(-1.0, 1.0, height)
-    b = tf.linspace(-1.0, 1.0, width)
-    xx, yy = tf.meshgrid(a, b, indexing='ij')
-    pts = tf.stack([yy, xx], axis=-1)
-    return tf.reshape(pts, [-1, 2])
-
-
-def _decowa_noisy_grid(width, height, noise_map):
-    grid = _decowa_grid_points_2d(width, height)
-    mod = tf.pad(noise_map, [[1, 1], [1, 1], [0, 0]])
-    return grid + tf.reshape(mod, [-1, 2])
-
-
-def _decowa_K(x_val, y_val):
-    eps = 1e-9
-    d2 = tf.reduce_sum(tf.square(x_val[:, :, None, :] - y_val[:, None, :, :]), axis=-1)
-    return d2 * tf.math.log(d2 + eps)
-
-
-def _decowa_P(x_val):
-    n_val = tf.shape(x_val)[0]
-    k_val = tf.shape(x_val)[1]
-    return tf.concat([tf.ones([n_val, k_val, 1]), x_val], axis=-1)
-
-
-def _decowa_tps_coeffs(x_val, y_val):
-    k_val = tf.shape(x_val)[1]
-    n_val = tf.shape(x_val)[0]
-    k_mat = _decowa_K(x_val, x_val)
-    p_mat = _decowa_P(x_val)
-    top = tf.concat([k_mat, p_mat], axis=-1)
-    bottom = tf.concat([tf.transpose(p_mat, [0, 2, 1]), tf.zeros([n_val, 3, 3])], axis=-1)
-    l_mat = tf.concat([top, bottom], axis=1)
-    z_mat = tf.concat([y_val, tf.zeros([n_val, 3, 2])], axis=1)
-    q_val = tf.linalg.solve(l_mat, z_mat)
-    return q_val[:, :k_val], q_val[:, k_val:]
-
-
-def _decowa_dense_grid(height, width):
-    gx = tf.linspace(-1.0, 1.0, width)
-    gy = tf.linspace(-1.0, 1.0, height)
-    x0 = tf.tile(gx[None, None, :], [1, height, 1])
-    y0 = tf.tile(gy[None, :, None], [1, 1, width])
-    grid = tf.stack([x0, y0], axis=-1)
-    return tf.reshape(grid, [1, height * width, 2])
-
-
-def _decowa_tps_grid(x_val, y_val, height, width):
-    w_coef, a_coef = _decowa_tps_coeffs(x_val, y_val)
-    base = _decowa_dense_grid(height, width)
-    u_mat = _decowa_K(base, x_val)
-    p_mat = _decowa_P(base)
-    grid = tf.matmul(p_mat, a_coef) + tf.matmul(u_mat, w_coef)
-    return tf.reshape(grid, [1, height, width, 2])
-
-
-def _decowa_grid_sample(img, grid):
-    n_val = tf.shape(img)[0]
-    height = tf.shape(img)[1]
-    width = tf.shape(img)[2]
-    height_f = tf.cast(height, tf.float32)
-    width_f = tf.cast(width, tf.float32)
-    x_val = grid[..., 0]
-    y_val = grid[..., 1]
-    ix = ((x_val + 1.0) * width_f - 1.0) / 2.0
-    iy = ((y_val + 1.0) * height_f - 1.0) / 2.0
-    ix0 = tf.floor(ix)
-    iy0 = tf.floor(iy)
-    wx1 = ix - ix0
-    wy1 = iy - iy0
-    wx0 = 1.0 - wx1
-    wy0 = 1.0 - wy1
-
-    def sample(ixc, iyc):
-        in_x = tf.logical_and(ixc >= 0.0, ixc <= width_f - 1.0)
-        in_y = tf.logical_and(iyc >= 0.0, iyc <= height_f - 1.0)
-        mask = tf.cast(tf.logical_and(in_x, in_y), tf.float32)[..., None]
-        xc = tf.clip_by_value(tf.cast(ixc, tf.int32), 0, width - 1)
-        yc = tf.clip_by_value(tf.cast(iyc, tf.int32), 0, height - 1)
-        bidx = tf.broadcast_to(tf.reshape(tf.range(n_val), [n_val, 1, 1]), tf.shape(xc))
-        idx = tf.stack([bidx, yc, xc], axis=-1)
-        return tf.gather_nd(img, idx) * mask
-
-    v00 = sample(ix0, iy0)
-    v01 = sample(ix0, iy0 + 1.0)
-    v10 = sample(ix0 + 1.0, iy0)
-    v11 = sample(ix0 + 1.0, iy0 + 1.0)
-    return (
-        v00 * (wx0 * wy0)[..., None]
-        + v10 * (wx1 * wy0)[..., None]
-        + v01 * (wx0 * wy1)[..., None]
-        + v11 * (wx1 * wy1)[..., None]
-    )
-
-
-def _decowa_warp(adv, noise_map, height, width):
-    x_val = _decowa_grid_points_2d(DECOWA_MESH, DECOWA_MESH)[None, ...]
-    y_val = _decowa_noisy_grid(DECOWA_MESH, DECOWA_MESH, noise_map)[None, ...]
-    grid = _decowa_tps_grid(x_val, y_val, height, width)
-    grid = tf.tile(grid, [tf.shape(adv)[0], 1, 1, 1])
-    return _decowa_grid_sample(adv, grid)
-
-
-def _decowa_update_noise_map(model, adv, tgt_emb, attack_type, height, width):
-    noise_map = (tf.random.uniform([DECOWA_MESH - 2, DECOWA_MESH - 2, 2]) - 0.5) * DECOWA_NOISE_SCALE
-    with tf.GradientTape() as tape:
-        tape.watch(noise_map)
-        warped = _decowa_warp(adv, noise_map, height, width)
-        emb = compute_embedding(model, warped)
-        cos = tf.reduce_sum(emb * tgt_emb, axis=1)
-        loss = attack_loss(cos, attack_type)
-    grad = tape.gradient(loss, noise_map)
-    if grad is None:
-        return noise_map
-    grad = tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
-    return noise_map - DECOWA_RHO * grad
-
-
-# Student-contributed attack integration:
-# DeCowA by Om Singh Rawat (IIT Delhi)
-# Paper basis: Boosting Adversarial Transferability across Model Genus by
-# Deformation-Constrained Warping (AAAI 2024)
-def decowa(model, x, tgt_emb, attack_type, input_size):
-    adv = tf.identity(x)
-    g = tf.zeros_like(x)
-    alpha = EPSILON / NUM_ITER
-    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
-    height, width = int(input_size[1]), int(input_size[0])
-    for _ in range(NUM_ITER):
-        grads = tf.zeros_like(x)
-        for _ in range(DECOWA_NUM_WARPING):
-            noise_map = _decowa_update_noise_map(model, tf.stop_gradient(adv), tgt_emb, attack_type, height, width)
-            with tf.GradientTape() as tape:
-                tape.watch(adv)
-                warped = _decowa_warp(adv, noise_map, height, width)
-                emb = compute_embedding(model, warped)
-                cos = tf.reduce_sum(emb * tgt_emb, axis=1)
-                loss = attack_loss(cos, attack_type)
-            grad = tape.gradient(loss, adv)
-            grads += tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
-        grads = grads / DECOWA_NUM_WARPING
-        grads = grads / (tf.reduce_mean(tf.abs(grads)) + 1e-8)
-        g = DECAY * g + grads
-        adv = adv + alpha * tf.sign(g)
-        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
-        adv = tf.clip_by_value(adv, -1.0, 1.0)
-    return adv
-
-
-def sia_vertical_shift(block):
-    h_val = tf.shape(block)[1]
-    shift = tf.random.uniform([], 0, tf.maximum(h_val, 1), dtype=tf.int32)
-    return tf.roll(block, shift=shift, axis=1)
-
-
-def sia_horizontal_shift(block):
-    w_val = tf.shape(block)[2]
-    shift = tf.random.uniform([], 0, tf.maximum(w_val, 1), dtype=tf.int32)
-    return tf.roll(block, shift=shift, axis=2)
-
-
-def sia_vertical_flip(block):
-    return tf.reverse(block, axis=[1])
-
-
-def sia_horizontal_flip(block):
-    return tf.reverse(block, axis=[2])
-
-
-def sia_rotate180(block):
-    return tf.reverse(block, axis=[1, 2])
-
-
-def sia_scale(block):
-    factor = tf.random.uniform([], 0.5, 1.0)
-    return factor * block
-
-
-def sia_add_noise(block):
-    noise = tf.random.uniform(tf.shape(block), -EPSILON, EPSILON)
-    return block + noise
-
-
-SIA_OPS = [
-    sia_vertical_shift,
-    sia_horizontal_shift,
-    sia_vertical_flip,
-    sia_horizontal_flip,
-    sia_rotate180,
-    sia_scale,
-    sia_add_noise,
-]
-
-
-def sia_block_transform(x_val, num_block=3):
-    h_val, w_val = x_val.shape[1], x_val.shape[2]
-
-    def split_points(size, n_parts):
-        if size <= n_parts:
-            return [0, size]
-        pts = sorted(np.random.choice(range(1, size), n_parts - 1, replace=False).tolist())
-        return [0] + pts + [size]
-
-    h_pts = split_points(h_val, num_block)
-    w_pts = split_points(w_val, num_block)
-
-    rows = []
-    for i in range(len(h_pts) - 1):
-        cols = []
-        for j in range(len(w_pts) - 1):
-            block = x_val[:, h_pts[i]:h_pts[i + 1], w_pts[j]:w_pts[j + 1], :]
-            op = SIA_OPS[np.random.randint(len(SIA_OPS))]
-            cols.append(op(block))
-        rows.append(tf.concat(cols, axis=2))
-    return tf.concat(rows, axis=1)
-
-
-# Student-contributed attack integration:
-# SIA_MI_TI by Janhavi Kishor
-# Paper basis: Structure Invariant Transformation for better Adversarial Transferability
-# (ICCV 2023) combined with MI-FGSM and TI-FGSM
-def sia_mi_ti(model, x, tgt_emb, attack_type, num_copies=5, num_block=3):
-    adv = tf.identity(x)
-    g = tf.zeros_like(x)
-    alpha = EPSILON / NUM_ITER
-    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
-    kernel = gaussian_kernel()
-
+    tgt_emb = tf.nn.l2_normalize(compute_embedding(model, tgt), axis=1)
+    
     for _ in range(NUM_ITER):
         with tf.GradientTape() as tape:
             tape.watch(adv)
-            copies = [sia_block_transform(adv, num_block) for _ in range(num_copies)]
-            batch = tf.concat(copies, axis=0)
-            emb = compute_embedding(model, batch)
-            tgt_rep = tf.repeat(tgt_emb, num_copies, axis=0)
-            cos = tf.reduce_sum(emb * tgt_rep, axis=1)
+            emb = compute_embedding(model, adv)
+            cos = tf.reduce_sum(emb * tgt_emb, axis=1)
             loss = attack_loss(cos, attack_type)
+            
         grad = tape.gradient(loss, adv)
-        grad = tf.nn.depthwise_conv2d(grad, kernel, [1, 1, 1, 1], 'SAME')
         grad = grad / (tf.reduce_mean(tf.abs(grad)) + 1e-8)
         g = DECAY * g + grad
         adv = adv + alpha * tf.sign(g)
-        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
+        adv = tf.clip_by_value(adv, morphed_tensor - EPSILON, morphed_tensor + EPSILON)
         adv = tf.clip_by_value(adv, -1.0, 1.0)
+        
     return adv
 
 
+# --- Execution Router ---
 def build_attacker(model_name: str):
     return DeepFace.build_model(model_name).model
 
@@ -642,15 +340,11 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
         return ti_fgsm(model, src, tgt_emb, attack_type)
     if attack_name == 'SI_NI_FGSM':
         return si_ni_fgsm(model, src, tgt_emb, attack_type)
+    if attack_name == 'DYNAMIC_MORPH':
+        return dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size)
+    if attack_name == 'SEMANTIC_MI_FGSM':
+        return semantic_mi_fgsm(model, src, tgt_emb, attack_type, input_size)
     if attack_name == 'MI_ADMIX_DI_TI':
         pool_imgs = tf.concat([src, tgt, src], axis=0)
         return mi_admix_di_ti(model, src, tgt_emb, attack_type, pool_imgs, input_size)
-    if attack_name == 'BPA_CNN':
-        return bpa_cnn(model, src, tgt_emb, attack_type)
-    if attack_name == 'BSR':
-        return bsr(model, src, tgt_emb, attack_type)
-    if attack_name == 'DECOWA':
-        return decowa(model, src, tgt_emb, attack_type, input_size)
-    if attack_name == 'SIA_MI_TI':
-        return sia_mi_ti(model, src, tgt_emb, attack_type)
     raise ValueError(f'Unsupported attack: {attack_name}')
