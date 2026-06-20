@@ -93,3 +93,25 @@ Read:
 - `results_student_attacks/sia_mi_ti/sia_mi_ti_vs_current_baseline_summary.csv`
 - `results_student_attacks/bpa_cnn/README.md`
 - `results_student_attacks/bpa_cnn/bpa_cnn_vs_current_baseline_summary.csv`
+
+
+
+
+## ⚙️ How to Run the D-FMA Attack
+
+To reproduce the D-FMA results on the `docs/subset_input_pairs.csv` subset, ensure your dataset (`dataset_extractedfaces`) and victim weights (`ir152.pth`) are placed in the root directory.
+
+Run the following commands sequentially from the repository root to generate the adversarial images for all surrogate models:
+
+```bash
+# 1. Generate Morphs using Facenet512 Surrogate
+python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_input_pairs.csv --dataset-root dataset_extractedfaces --output-root results_baseline --attacker-model Facenet512 --attacks DYNAMIC_MORPH
+
+# 2. Generate Morphs using ArcFace Surrogate
+python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_input_pairs.csv --dataset-root dataset_extractedfaces --output-root results_baseline --attacker-model ArcFace --attacks DYNAMIC_MORPH
+
+# 3. Generate Morphs using GhostFaceNet Surrogate
+python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_input_pairs.csv --dataset-root dataset_extractedfaces --output-root results_baseline --attacker-model GhostFaceNet --attacks DYNAMIC_MORPH
+
+# 4. Generate Morphs using VGG-Face Surrogate
+python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_input_pairs.csv --dataset-root dataset_extractedfaces --output-root results_baseline --attacker-model VGG-Face --attacks DYNAMIC_MORPH
