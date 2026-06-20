@@ -117,6 +117,22 @@ python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_inpu
 python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_input_pairs.csv --dataset-root dataset_extractedfaces --output-root results_baseline --attacker-model VGG-Face --attacks DYNAMIC_MORPH
 
 
+### Verification Commands
+To generate the adversarial datasets across all four surrogate frameworks using the official repository architecture, open your terminal at the project root directory and run the following statements sequentially:
+
+```bash
+# Execute using Facenet512 Backbone
+python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_input_pairs.csv --dataset-root dataset_extractedfaces --output-root results_baseline --attacker-model Facenet512 --attacks DYNAMIC_MORPH
+
+# Execute using ArcFace Backbone
+python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_input_pairs.csv --dataset-root dataset_extractedfaces --output-root results_baseline --attacker-model ArcFace --attacks DYNAMIC_MORPH
+
+# Execute using GhostFaceNet Backbone
+python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_input_pairs.csv --dataset-root dataset_extractedfaces --output-root results_baseline --attacker-model GhostFaceNet --attacks DYNAMIC_MORPH
+
+# Execute using VGG-Face Backbone
+python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_input_pairs.csv --dataset-root dataset_extractedfaces --output-root results_baseline --attacker-model VGG-Face --attacks DYNAMIC_MORPH
+
 # Recompile the final summaries
 python -m scripts.build_subset_baselines --raw-long-csv results_baseline/combined_raw_similarities_long.csv --input-csv docs/subset_input_pairs.csv --thresholds-json core/verification_thresholds.json --output-dir results_baseline
 The final metrics will be output to results_baseline/subset_attack_summary_by_goal.csv.
