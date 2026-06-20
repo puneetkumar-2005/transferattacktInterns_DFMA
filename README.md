@@ -115,3 +115,8 @@ python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_inpu
 
 # 4. Generate Morphs using VGG-Face Surrogate
 python -m experiments.run_vanilla_subset_generation --input-csv docs/subset_input_pairs.csv --dataset-root dataset_extractedfaces --output-root results_baseline --attacker-model VGG-Face --attacks DYNAMIC_MORPH
+
+
+# Recompile the final summaries
+python -m scripts.build_subset_baselines --raw-long-csv results_baseline/combined_raw_similarities_long.csv --input-csv docs/subset_input_pairs.csv --thresholds-json core/verification_thresholds.json --output-dir results_baseline
+The final metrics will be output to results_baseline/subset_attack_summary_by_goal.csv.
