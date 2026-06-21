@@ -1,0 +1,65 @@
+=============================================================================
+FINAL EVALUATION REPORT: DYNAMIC FEATURE-MIXING ATTACK (D-FMA)
+=============================================================================
+
+1. EXECUTIVE SUMMARY
+-----------------------------------------------------------------------------
+This report details the evaluation of the Dynamic Feature-Mixing Attack (D-FMA) 
+on the docs/subset_input_pairs.csv subset. D-FMA operates by isolating and 
+blending the highly discriminative periocular and nasal regions using a 
+Gaussian-blurred static mask prior to MI-FGSM optimization. 
+
+The attack was generated across four distinct surrogate architectures 
+(Facenet512, ArcFace, GhostFaceNet, VGG-Face) and evaluated for cross-model 
+transferability. D-FMA achieved an average transfer breach rate of 59.17%, 
+outperforming the top baseline (SI-NI-FGSM) by exactly 30.00%.
+
+2. OVERALL BENCHMARK COMPARISON
+-----------------------------------------------------------------------------
+The following metrics represent the average cross-model breach rate across 
+the evaluation subset:
+
+  1. D-FMA (Proposed)    : 59.17%  <-- NEW STATE-OF-THE-ART
+  2. SI_NI_FGSM          : 29.17%
+  3. MI_FGSM             : 26.67%
+  4. MI_ADMIX_DI_TI      : 24.17%
+  5. TI_FGSM             : 20.42%
+  6. PGD                 : 16.67%
+
+3. PER-SURROGATE BREAKDOWN (D-FMA)
+-----------------------------------------------------------------------------
+Total Pairs Tested per Surrogate: 120 (480 total evaluations)
+
+* VGG-Face Surrogate:
+  - Successful Breaches : 82 / 120
+  - Transfer Breach Rate: 68.33%
+
+* Facenet512 Surrogate:
+  - Successful Breaches : 80 / 120
+  - Transfer Breach Rate: 66.67%
+
+* ArcFace Surrogate:
+  - Successful Breaches : 65 / 120
+  - Transfer Breach Rate: 54.17%
+
+* GhostFaceNet Surrogate:
+  - Successful Breaches : 57 / 120
+  - Transfer Breach Rate: 47.50%
+
+4. METHODOLOGICAL ADVANTAGE
+-----------------------------------------------------------------------------
+The standard baselines (PGD, MI-FGSM, etc.) rely on global pixel-level noise 
+that frequently overfits to the surrogate model's spatial layout. By contrast, 
+D-FMA physically alters the fundamental semantic geometry of the face before 
+optimization. By forcing the victim model to evaluate conflicting spatial 
+anchors (e.g., Target identity's eyes mathematically blended into the Source 
+identity's facial structure), D-FMA successfully bypassed the robust filtering 
+defenses of the victim architectures, resulting in a >2x increase in 
+transferability over standard MI-FGSM.
+
+5. CODE INTEGRATION
+-----------------------------------------------------------------------------
+The D-FMA attack was successfully integrated into the existing framework within 
+the core/transfer_attack_core.py file, maintaining strict compliance with the 
+repository's structural guidelines. The attack executes fully autonomously 
+when the 'DYNAMIC_MORPH' flag is passed to the generation pipeline.
